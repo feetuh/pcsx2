@@ -83,7 +83,9 @@ jobs:
       # actions/checkout elides tags, fetch them primarily for releases
       - name: Fetch Tags
         if: ${{ inputs.fetchTags }}
-        run: git fetch --tags --no-recurse-submodules
+        # rust-fm fork: unshallow so `git describe` reaches the v2.8.2 tag below the fork
+        # commits. In a depth-1 clone it fails and the version becomes the bare short hash.
+        run: git fetch --tags --no-recurse-submodules --unshallow
 
       - name: Add stable release identifier file
         if: ${{ inputs.stableBuild == true || inputs.stableBuild == 'true' }}
