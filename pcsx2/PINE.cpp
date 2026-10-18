@@ -1,21 +1,34 @@
 // SPDX-FileCopyrightText: 2002-2026 PCSX2 Dev Team
 // SPDX-License-Identifier: GPL-3.0+
 
+#include "Achievements.h"
 #include "BuildVersion.h"
 #include "Common.h"
+#include "Counters.h"
 #include "Host.h"
 #include "Elfheader.h"
 #include "SaveState.h"
 #include "PINE.h"
 #include "VMManager.h"
 #include "vtlb.h"
+#include "Recording/InputRecording.h"
 #include "common/Error.h"
+#include "common/FileSystem.h"
 #include "common/Threading.h"
 
+#include <array>
 #include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
+#include <functional>
+#include <memory>
+#include <mutex>
+#include <optional>
 #include <span>
+#include <string_view>
 #include <sys/types.h>
 #include <thread>
 
@@ -159,8 +172,28 @@ namespace PINEServer
 		MsgUUID = 0xD, /**< Returns the game UUID. */
 		MsgGameVersion = 0xE, /**< Returns the game verion. */
 		MsgStatus = 0xF, /**< Returns the emulator status. */
+		// rust-fm control fork. Private, not for upstream; 0x80-0x9F so we never
+		// collide with upstream or other forks. Replies are sent once the work is done.
+		MsgForkInfo = 0x80, /**< Returns the fork API version and build. */
+		MsgPauseSync = 0x81, /**< Pauses the VM. */
+		MsgResumeSync = 0x82, /**< Resumes the VM. */
+		MsgFrameAdvanceSync = 0x83, /**< Advances N frames from paused, returns the frame count. */
+		MsgFrameInfo = 0x84, /**< Returns frame, VM and input recording state. */
+		MsgRecordingPlay = 0x87, /**< Plays an input recording from paused. */
+		MsgRecordingStop = 0x88, /**< Stops the input recording. */
+		MsgLoadStateFileSync = 0x89, /**< Loads a savestate file. */
+		MsgSaveStateFileSync = 0x8A, /**< Saves a savestate file. */
 		MsgUnimplemented = 0xFF /**< Unimplemented IPC message. */
 	};
+
+	/**
+	 * Fork API version, reported by MsgForkInfo.
+	 * Bump it whenever a fork command is added or its wire format changes.
+	 */
+	static constexpr u32 FORK_API_VERSION = 1;
+
+	// Most frames MsgFrameAdvanceSync advances in one request (one minute at 60 fps).
+	static constexpr u32 MAX_FRAME_ADVANCE = 3600;
 
 	/**
 	 * Emulator status enum.
@@ -257,6 +290,125 @@ namespace PINEServer
 	{
 		return !((command_len + command_size) > buf_size ||
 				 (reply_len + reply_size) >= MAX_IPC_RETURN_SIZE);
+	}
+
+	/**
+	 * Reads a fork request string: u32 byte length, then that many UTF-8
+	 * bytes without a NUL. Advances buf_cnt past it.
+	 * return value: false if it doesn't fit in the request or holds a NUL.
+	 */
+	static bool ReadRequestString(std::span<u8> buf, u32 buf_size, u32& buf_cnt, std::string* out)
+	{
+		if (!SafetyChecks(buf_cnt, 4, 0, 0, buf_size))
+			return false;
+		const u32 size = FromSpan<u32>(buf, buf_cnt);
+		if (size > buf_size - buf_cnt - 4)
+			return false;
+		out->assign(reinterpret_cast<const char*>(&buf[buf_cnt + 4]), size);
+		if (out->find('\0') != std::string::npos)
+			return false;
+		buf_cnt += 4 + size;
+		return true;
+	}
+
+	/**
+	 * Size a string takes in a reply, see WriteResultString().
+	 */
+	static u32 ResultStringSize(std::string_view str)
+	{
+		return 4 + static_cast<u32>(str.size()) + 1;
+	}
+
+	/**
+	 * Appends a string to a reply like the stock commands do: u32 size
+	 * including the NUL, the bytes, then the NUL. Check the size first.
+	 */
+	static void WriteResultString(std::vector<u8>& ret_buffer, std::string_view str, u32& ret_cnt)
+	{
+		ToResultVector<u32>(ret_buffer, static_cast<u32>(str.size()) + 1, ret_cnt);
+		std::memcpy(&ret_buffer[ret_cnt + 4], str.data(), str.size());
+		ret_buffer[ret_cnt + 4 + str.size()] = 0;
+		ret_cnt += ResultStringSize(str);
+	}
+
+	/**
+	 * Runs a function on the CPU thread and waits for its result.
+	 * Host::RunOnCPUThread(fn, true) could deadlock: Deinitialize() runs on
+	 * the CPU thread and joins this one. So if the function hasn't started
+	 * within start_timeout, or the server is stopping, it's cancelled and
+	 * never runs. Once started, we wait for it to finish.
+	 * The function must capture by value; it may outlive this call.
+	 * return value: the result, or nullopt if cancelled or abandoned.
+	 */
+	template <typename T>
+	static std::optional<T> RunOnCPUThreadAndWait(std::function<T()> func,
+		std::chrono::milliseconds start_timeout = std::chrono::seconds(30))
+	{
+		struct Call
+		{
+			std::mutex mutex;
+			std::condition_variable cv;
+			bool started = false;
+			bool cancelled = false;
+			std::optional<T> result;
+		};
+		const std::shared_ptr<Call> call = std::make_shared<Call>();
+
+		Host::RunOnCPUThread([call, func = std::move(func)]() {
+			{
+				std::unique_lock lock(call->mutex);
+				if (call->cancelled)
+					return;
+				call->started = true;
+			}
+			T result = func();
+			{
+				std::unique_lock lock(call->mutex);
+				call->result = std::move(result);
+			}
+			call->cv.notify_all();
+		});
+
+		const auto deadline = std::chrono::steady_clock::now() + start_timeout;
+		std::unique_lock lock(call->mutex);
+		while (!call->result.has_value())
+		{
+			if (s_end.load(std::memory_order_acquire) ||
+				(!call->started && std::chrono::steady_clock::now() >= deadline))
+			{
+				call->cancelled = true;
+				return std::nullopt;
+			}
+			call->cv.wait_for(lock, std::chrono::milliseconds(50));
+		}
+		return call->result;
+	}
+
+	/**
+	 * Waits until a frame advance has paused the VM again.
+	 * return value: false on timeout, shutdown, or if the server is stopping.
+	 */
+	static bool WaitForFrameAdvancePause(u32 frames)
+	{
+		// Generous, so slow emulation doesn't fail; the VM still pauses if we give up.
+		// Needs proper testing with long advances at low emulation speed.
+		const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10) +
+		                      std::chrono::milliseconds(100) * frames;
+		while (!s_end.load(std::memory_order_acquire) && std::chrono::steady_clock::now() < deadline)
+		{
+			switch (VMManager::GetState())
+			{
+				case VMState::Paused:
+					return true;
+				case VMState::Running:
+				case VMState::Resetting:
+					break;
+				default:
+					return false;
+			}
+			std::this_thread::sleep_for(std::chrono::milliseconds(1));
+		}
+		return false;
 	}
 } // namespace PINEServer
 
@@ -744,6 +896,186 @@ PINEServer::IPCBuffer PINEServer::ParseCommand(std::span<u8> buf, std::vector<u8
 
 				ToResultVector(ret_buffer, status, ret_cnt);
 				ret_cnt += 4;
+				break;
+			}
+			case MsgForkInfo:
+			{
+				const std::string_view rev = BuildVersion::GitRev;
+				const std::string_view hash = BuildVersion::GitHash;
+				if (!SafetyChecks(buf_cnt, 0, ret_cnt, 4 + ResultStringSize(rev) + ResultStringSize(hash), buf_size)) [[unlikely]]
+					goto error;
+				ToResultVector<u32>(ret_buffer, FORK_API_VERSION, ret_cnt);
+				ret_cnt += 4;
+				WriteResultString(ret_buffer, rev, ret_cnt);
+				WriteResultString(ret_buffer, hash, ret_cnt);
+				break;
+			}
+			case MsgPauseSync:
+			{
+				if (!VMManager::HasValidVM() || Achievements::IsHardcoreModeActive())
+					goto error;
+				const std::optional<bool> paused = RunOnCPUThreadAndWait<bool>([]() {
+					if (VMManager::GetState() == VMState::Running)
+						VMManager::SetPaused(true);
+					return VMManager::GetState() == VMState::Paused;
+				});
+				if (!paused.value_or(false))
+					goto error;
+				break;
+			}
+			case MsgResumeSync:
+			{
+				if (!VMManager::HasValidVM() || Achievements::IsHardcoreModeActive())
+					goto error;
+				const std::optional<bool> running = RunOnCPUThreadAndWait<bool>([]() {
+					if (VMManager::GetState() == VMState::Paused)
+						VMManager::SetPaused(false);
+					return VMManager::GetState() == VMState::Running;
+				});
+				if (!running.value_or(false))
+					goto error;
+				break;
+			}
+			case MsgFrameAdvanceSync:
+			{
+				if (!VMManager::HasValidVM() || Achievements::IsHardcoreModeActive())
+					goto error;
+				if (!SafetyChecks(buf_cnt, 4, ret_cnt, 4, buf_size)) [[unlikely]]
+					goto error;
+				const u32 frames = FromSpan<u32>(buf, buf_cnt);
+				buf_cnt += 4;
+				if (frames < 1 || frames > MAX_FRAME_ADVANCE)
+					goto error;
+				// Same call as the frame advance hotkey, so stepping matches it.
+				const std::optional<bool> started = RunOnCPUThreadAndWait<bool>([frames]() {
+					if (VMManager::GetState() != VMState::Paused)
+						return false;
+					VMManager::FrameAdvance(frames);
+					return VMManager::GetState() == VMState::Running;
+				});
+				if (!started.value_or(false) || !WaitForFrameAdvancePause(frames))
+					goto error;
+				// Read on the CPU thread, which is back in its paused loop by now.
+				const std::optional<u32> frame = RunOnCPUThreadAndWait<u32>([]() { return g_FrameCount; });
+				if (!frame.has_value())
+					goto error;
+				ToResultVector<u32>(ret_buffer, frame.value(), ret_cnt);
+				ret_cnt += 4;
+				break;
+			}
+			case MsgFrameInfo:
+			{
+				if (Achievements::IsHardcoreModeActive())
+					goto error;
+				if (!SafetyChecks(buf_cnt, 0, ret_cnt, 16, buf_size)) [[unlikely]]
+					goto error;
+				const std::optional<std::array<u8, 16>> info = RunOnCPUThreadAndWait<std::array<u8, 16>>([]() {
+					std::array<u8, 16> data = {};
+					const bool active = g_InputRecording.isActive();
+					const u32 frame = g_FrameCount;
+					const u32 rec_frame = active ? g_InputRecording.getFrameCounter() : 0;
+					const u32 rec_total = active ? g_InputRecording.getData().getTotalFrames() : 0;
+					std::memcpy(&data[0], &frame, sizeof(frame));
+					data[4] = static_cast<u8>(VMManager::GetState());
+					data[5] = active;
+					data[6] = active && g_InputRecording.getControls().isRecording();
+					std::memcpy(&data[7], &rec_frame, sizeof(rec_frame));
+					std::memcpy(&data[11], &rec_total, sizeof(rec_total));
+					return data;
+				});
+				if (!info.has_value())
+					goto error;
+				std::memcpy(&ret_buffer[ret_cnt], info->data(), info->size());
+				ret_cnt += info->size();
+				break;
+			}
+			case MsgRecordingPlay:
+			{
+				std::string path;
+				if (!ReadRequestString(buf, buf_size, buf_cnt, &path) || path.empty())
+					goto error;
+				if (!VMManager::HasValidVM() || Achievements::IsHardcoreModeActive())
+					goto error;
+				// Mirrors MainWindow::onInputRecPlayActionTriggered(), minus the dialog.
+				const std::optional<bool> playing = RunOnCPUThreadAndWait<bool>([path]() {
+					if (!EmuConfig.EnableRecordingTools)
+					{
+						Console.Error("PINE: Input recording tools are disabled.");
+						return false;
+					}
+					if (VMManager::GetState() != VMState::Paused)
+						return false;
+					if (g_InputRecording.isActive())
+						g_InputRecording.stop();
+					if (g_InputRecording.isActive())
+						return false;
+					return g_InputRecording.play(path);
+				});
+				if (!playing.value_or(false))
+					goto error;
+				break;
+			}
+			case MsgRecordingStop:
+			{
+				if (!VMManager::HasValidVM() || Achievements::IsHardcoreModeActive())
+					goto error;
+				// Closes now when paused, otherwise at the end of the current frame.
+				const std::optional<bool> stopped = RunOnCPUThreadAndWait<bool>([]() {
+					g_InputRecording.stop();
+					return true;
+				});
+				if (!stopped.has_value())
+					goto error;
+				break;
+			}
+			case MsgLoadStateFileSync:
+			{
+				std::string path;
+				if (!ReadRequestString(buf, buf_size, buf_cnt, &path) || path.empty())
+					goto error;
+				if (!VMManager::HasValidVM() || Achievements::IsHardcoreModeActive())
+					goto error;
+				const std::optional<bool> loaded = RunOnCPUThreadAndWait<bool>([path]() {
+					// LoadState() resets the VM on failure, so don't let a bad path get that far.
+					if (!FileSystem::FileExists(path.c_str()))
+					{
+						Console.Error(fmt::format("PINE: Savestate '{}' does not exist.", path));
+						return false;
+					}
+					Error load_error;
+					if (!VMManager::LoadState(path.c_str(), &load_error))
+					{
+						Console.Error(fmt::format("PINE: Failed to load '{}': {}", path, load_error.GetDescription()));
+						return false;
+					}
+					return true;
+				});
+				if (!loaded.value_or(false))
+					goto error;
+				break;
+			}
+			case MsgSaveStateFileSync:
+			{
+				std::string path;
+				if (!ReadRequestString(buf, buf_size, buf_cnt, &path) || path.empty())
+					goto error;
+				if (!VMManager::HasValidVM() || Achievements::IsHardcoreModeActive())
+					goto error;
+				const std::optional<bool> saved = RunOnCPUThreadAndWait<bool>([path]() {
+					std::string save_error;
+					VMManager::SaveState(path.c_str(), false, false, [&save_error](const std::string& error) {
+						save_error = error.empty() ? std::string("unknown error") : error;
+					});
+					VMManager::WaitForSaveStateFlush();
+					if (!save_error.empty())
+					{
+						Console.Error(fmt::format("PINE: Failed to save '{}': {}", path, save_error));
+						return false;
+					}
+					return true;
+				});
+				if (!saved.value_or(false))
+					goto error;
 				break;
 			}
 			default:
