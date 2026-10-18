@@ -153,6 +153,10 @@ bool DisplaySurface::isFullScreen() const
 
 void DisplaySurface::setFocus()
 {
+	// rust-fm control fork: no-GUI sessions are driven over PINE, never take focus from the user.
+	if (Host::InNoGUIMode())
+		return;
+
 	if (m_container)
 		m_container->setFocus();
 	else

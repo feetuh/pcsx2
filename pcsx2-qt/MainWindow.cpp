@@ -1339,7 +1339,8 @@ void MainWindow::updateWindowState(bool force_visible)
 	const bool has_window = s_vm_valid || m_display_surface;
 
 	// Need to test both valid and display widget because of startup (vm invalid while window is created).
-	const bool visible = force_visible || !hide_window || !has_window;
+	// rust-fm control fork: the main window stays hidden in no-GUI mode.
+	const bool visible = (force_visible || !hide_window || !has_window) && !Host::InNoGUIMode();
 	if (isVisible() != visible)
 		setVisible(visible);
 
@@ -2908,6 +2909,18 @@ void MainWindow::createDisplayWidget(bool fullscreen, bool render_to_main)
 		m_display_container->setWindowTitle(windowTitle());
 		m_display_container->setWindowIcon(windowIcon());
 #endif
+
+		// rust-fm control fork: show the render window without activating it in no-GUI mode, so a
+		// PINE-driven session never takes keyboard focus. On Windows this is WS_EX_NOACTIVATE, which
+		// also keeps it off the taskbar. Needs proper testing beyond Windows.
+		if (Host::InNoGUIMode())
+		{
+#ifdef DISPLAY_SURFACE_WINDOW
+			m_display_surface->setFlag(Qt::WindowDoesNotAcceptFocus, true);
+#else
+			m_display_container->setAttribute(Qt::WA_ShowWithoutActivating, true);
+#endif
+		}
 	}
 	else
 	{
