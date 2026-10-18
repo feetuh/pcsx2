@@ -1,0 +1,21 @@
+name: rust-fm Windows release-parity build
+
+# Private rust-fm control fork. Mirrors the build_windows_qt job of
+# release_cut_new.yml at v2.8.2 so the binary matches the official release toolchain.
+on:
+  workflow_dispatch:
+  push:
+    branches: ["rustfm/**"]
+
+jobs:
+  build:
+    uses: ./.github/workflows/windows_build_qt.yml
+    with:
+      jobName: "rust-fm Windows (release parity)"
+      artifactPrefixName: "PCSX2-rustfm-windows-Qt-x64"
+      configuration: CMake
+      buildSystem: cmake
+      cmakeFlags: -DCMAKE_C_COMPILER=clang-cl -DCMAKE_CXX_COMPILER=clang-cl
+      fetchTags: true
+      stableBuild: true
+    secrets: inherit
