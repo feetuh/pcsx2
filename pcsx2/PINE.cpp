@@ -12,6 +12,7 @@
 #include "VMManager.h"
 #include "vtlb.h"
 #include "Recording/InputRecording.h"
+#include "Recording/PadData.h"
 #include "common/Error.h"
 #include "common/FileSystem.h"
 #include "common/Threading.h"
@@ -179,6 +180,8 @@ namespace PINEServer
 		MsgResumeSync = 0x82, /**< Resumes the VM. */
 		MsgFrameAdvanceSync = 0x83, /**< Advances N frames from paused, returns the frame count. */
 		MsgFrameInfo = 0x84, /**< Returns frame, VM and input recording state. */
+		MsgSetPadFrame = 0x85, /**< Overrides a pad with an 18 byte .p2m frame. */
+		MsgClearPadFrame = 0x86, /**< Removes a pad override. */
 		MsgRecordingPlay = 0x87, /**< Plays an input recording from paused. */
 		MsgRecordingStop = 0x88, /**< Stops the input recording. */
 		MsgLoadStateFileSync = 0x89, /**< Loads a savestate file. */
@@ -191,6 +194,12 @@ namespace PINEServer
 	 * Bump it whenever a fork command is added or its wire format changes.
 	 */
 	static constexpr u32 FORK_API_VERSION = 1;
+
+	/**
+	 * Pad overrides set by MsgSetPadFrame, one per port (slot 0 only).
+	 * Only touched on the CPU thread.
+	 */
+	static std::array<std::optional<std::array<u8, 18>>, 2> s_pad_overrides;
 
 	// Most frames MsgFrameAdvanceSync advances in one request (one minute at 60 fps).
 	static constexpr u32 MAX_FRAME_ADVANCE = 3600;
@@ -658,6 +667,22 @@ void PINEServer::Deinitialize()
 
 	if (s_thread.joinable())
 		s_thread.join();
+
+	// We're on the CPU thread. Pads keep their last state, as with MsgClearPadFrame.
+	s_pad_overrides = {};
+}
+
+void PINEServer::ApplyPadOverridesOnCPUThread()
+{
+	// Recordings own the pads while active.
+	if (g_InputRecording.isActive())
+		return;
+
+	for (u32 port = 0; port < s_pad_overrides.size(); port++)
+	{
+		if (s_pad_overrides[port].has_value())
+			PadData(port, 0, s_pad_overrides[port].value()).OverrideActualController();
+	}
 }
 
 PINEServer::IPCBuffer PINEServer::ParseCommand(std::span<u8> buf, std::vector<u8>& ret_buffer, u32 buf_size)
@@ -981,12 +1006,62 @@ PINEServer::IPCBuffer PINEServer::ParseCommand(std::span<u8> buf, std::vector<u8
 					data[6] = active && g_InputRecording.getControls().isRecording();
 					std::memcpy(&data[7], &rec_frame, sizeof(rec_frame));
 					std::memcpy(&data[11], &rec_total, sizeof(rec_total));
+					for (u32 port = 0; port < s_pad_overrides.size(); port++)
+						data[15] |= static_cast<u8>(s_pad_overrides[port].has_value() << port);
 					return data;
 				});
 				if (!info.has_value())
 					goto error;
 				std::memcpy(&ret_buffer[ret_cnt], info->data(), info->size());
 				ret_cnt += info->size();
+				break;
+			}
+			case MsgSetPadFrame:
+			{
+				if (!VMManager::HasValidVM() || Achievements::IsHardcoreModeActive())
+					goto error;
+				if (!SafetyChecks(buf_cnt, 1 + 18, ret_cnt, 0, buf_size)) [[unlikely]]
+					goto error;
+				const u8 port = FromSpan<u8>(buf, buf_cnt);
+				std::array<u8, 18> frame;
+				std::memcpy(frame.data(), &buf[buf_cnt + 1], frame.size());
+				buf_cnt += 1 + 18;
+				if (port >= s_pad_overrides.size())
+					goto error;
+				const std::optional<bool> set = RunOnCPUThreadAndWait<bool>([port, frame]() {
+					if (g_InputRecording.isActive())
+						return false;
+					// Apply now as well: when paused, the next input poll comes after the
+					// game has already read its pad for the next frame. Held keys apply
+					// immediately too, so stepping this way matches keyboard stepping.
+					s_pad_overrides[port] = frame;
+					PadData(port, 0, frame).OverrideActualController();
+					return true;
+				});
+				if (!set.value_or(false))
+					goto error;
+				break;
+			}
+			case MsgClearPadFrame:
+			{
+				if (Achievements::IsHardcoreModeActive())
+					goto error;
+				if (!SafetyChecks(buf_cnt, 1, ret_cnt, 0, buf_size)) [[unlikely]]
+					goto error;
+				// Port 0xFF clears every port.
+				const u8 port = FromSpan<u8>(buf, buf_cnt);
+				buf_cnt += 1;
+				if (port >= s_pad_overrides.size() && port != 0xFF)
+					goto error;
+				const std::optional<bool> cleared = RunOnCPUThreadAndWait<bool>([port]() {
+					if (port == 0xFF)
+						s_pad_overrides = {};
+					else
+						s_pad_overrides[port].reset();
+					return true;
+				});
+				if (!cleared.has_value())
+					goto error;
 				break;
 			}
 			case MsgRecordingPlay:
@@ -1009,6 +1084,7 @@ PINEServer::IPCBuffer PINEServer::ParseCommand(std::span<u8> buf, std::vector<u8
 						g_InputRecording.stop();
 					if (g_InputRecording.isActive())
 						return false;
+					s_pad_overrides = {};
 					return g_InputRecording.play(path);
 				});
 				if (!playing.value_or(false))

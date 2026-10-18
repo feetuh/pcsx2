@@ -19,4 +19,8 @@ namespace PINEServer
 
 	bool Initialize(int slot = PINE_DEFAULT_SLOT);
 	void Deinitialize();
+
+	// rust-fm control fork: re-applies the pad frames a client set with MsgSetPadFrame.
+	// Called on the CPU thread once per frame, after input recordings applied theirs.
+	void ApplyPadOverridesOnCPUThread();
 } // namespace PINEServer

@@ -2943,6 +2943,9 @@ void VMManager::Internal::PollInputOnCPUThread()
 		// so we can either read from it, or overwrite it!
 		g_InputRecording.handleControllerDataUpdate();
 	}
+
+	// rust-fm control fork: keep pad frames set over PINE applied. No-op unless a client set one.
+	PINEServer::ApplyPadOverridesOnCPUThread();
 }
 
 void VMManager::CheckForCPUConfigChanges(const Pcsx2Config& old_config)
