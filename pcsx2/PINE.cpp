@@ -5,8 +5,12 @@
 #include "BuildVersion.h"
 #include "Common.h"
 #include "Counters.h"
+#include "DebugTools/Breakpoints.h"
+#include "DebugTools/DebugInterface.h"
 #include "Host.h"
 #include "Elfheader.h"
+#include "GS/GS.h"
+#include "MTGS.h"
 #include "SaveState.h"
 #include "PINE.h"
 #include "VMManager.h"
@@ -15,6 +19,7 @@
 #include "Recording/PadData.h"
 #include "common/Error.h"
 #include "common/FileSystem.h"
+#include "common/StringUtil.h"
 #include "common/Threading.h"
 
 #include <array>
@@ -186,6 +191,11 @@ namespace PINEServer
 		MsgRecordingStop = 0x88, /**< Stops the input recording. */
 		MsgLoadStateFileSync = 0x89, /**< Loads a savestate file. */
 		MsgSaveStateFileSync = 0x8A, /**< Saves a savestate file. */
+		MsgEERegisters = 0x90, /**< Returns every EE register category, from paused. */
+		MsgAddExecBreakpoint = 0x91, /**< Adds or replaces an EE execute breakpoint. */
+		MsgRemoveBreakpoint = 0x92, /**< Removes an EE execute breakpoint. */
+		MsgListBreakpoints = 0x93, /**< Lists the EE execute breakpoints. */
+		MsgGSDump = 0x94, /**< Queues a screenshot and optional GS dump. */
 		MsgUnimplemented = 0xFF /**< Unimplemented IPC message. */
 	};
 
@@ -193,7 +203,7 @@ namespace PINEServer
 	 * Fork API version, reported by MsgForkInfo.
 	 * Bump it whenever a fork command is added or its wire format changes.
 	 */
-	static constexpr u32 FORK_API_VERSION = 1;
+	static constexpr u32 FORK_API_VERSION = 2;
 
 	/**
 	 * Pad overrides set by MsgSetPadFrame, one per port (slot 0 only).
@@ -391,6 +401,57 @@ namespace PINEServer
 			call->cv.wait_for(lock, std::chrono::milliseconds(50));
 		}
 		return call->result;
+	}
+
+	/**
+	 * Appends a value to a reply built off this thread, see CopyResult().
+	 */
+	template <typename T>
+	static void AppendResult(std::vector<u8>& out, const T& value)
+	{
+		const size_t pos = out.size();
+		out.resize(pos + sizeof(T));
+		std::memcpy(&out[pos], &value, sizeof(T));
+	}
+
+	/**
+	 * Appends a string to a reply built off this thread, as WriteResultString() does.
+	 */
+	static void AppendResultString(std::vector<u8>& out, std::string_view str)
+	{
+		AppendResult<u32>(out, static_cast<u32>(str.size()) + 1);
+		out.insert(out.end(), str.begin(), str.end());
+		out.push_back(0);
+	}
+
+	/**
+	 * Copies a reply built off this thread into the return buffer.
+	 * return value: false if it doesn't fit.
+	 */
+	static bool CopyResult(std::vector<u8>& ret_buffer, const std::vector<u8>& data, u32& ret_cnt)
+	{
+		if (data.size() >= MAX_IPC_RETURN_SIZE || !SafetyChecks(0, 0, ret_cnt, static_cast<int>(data.size())))
+			return false;
+		std::memcpy(&ret_buffer[ret_cnt], data.data(), data.size());
+		ret_cnt += static_cast<u32>(data.size());
+		return true;
+	}
+
+	/**
+	 * Does what the debugger window does when a breakpoint is hit, so resuming
+	 * doesn't stop on it again straight away. Nothing happens unless a breakpoint
+	 * was hit, and the debugger window may have done it already.
+	 * Only call on the CPU thread, before resuming.
+	 */
+	static void SkipTriggeredBreakpoint()
+	{
+		if (!CBreakPoints::GetBreakpointTriggered())
+			return;
+
+		CBreakPoints::ClearTemporaryBreakPoints();
+		CBreakPoints::SetBreakpointTriggered(false, BREAKPOINT_IOP_AND_EE);
+		CBreakPoints::SetSkipFirst(BREAKPOINT_EE, r5900Debug.getPC());
+		CBreakPoints::SetSkipFirst(BREAKPOINT_IOP, r3000Debug.getPC());
 	}
 
 	/**
@@ -954,7 +1015,10 @@ PINEServer::IPCBuffer PINEServer::ParseCommand(std::span<u8> buf, std::vector<u8
 					goto error;
 				const std::optional<bool> running = RunOnCPUThreadAndWait<bool>([]() {
 					if (VMManager::GetState() == VMState::Paused)
+					{
+						SkipTriggeredBreakpoint();
 						VMManager::SetPaused(false);
+					}
 					return VMManager::GetState() == VMState::Running;
 				});
 				if (!running.value_or(false))
@@ -975,6 +1039,7 @@ PINEServer::IPCBuffer PINEServer::ParseCommand(std::span<u8> buf, std::vector<u8
 				const std::optional<bool> started = RunOnCPUThreadAndWait<bool>([frames]() {
 					if (VMManager::GetState() != VMState::Paused)
 						return false;
+					SkipTriggeredBreakpoint();
 					VMManager::FrameAdvance(frames);
 					return VMManager::GetState() == VMState::Running;
 				});
@@ -1151,6 +1216,143 @@ PINEServer::IPCBuffer PINEServer::ParseCommand(std::span<u8> buf, std::vector<u8
 					return true;
 				});
 				if (!saved.value_or(false))
+					goto error;
+				break;
+			}
+			case MsgEERegisters:
+			{
+				if (!VMManager::HasValidVM() || Achievements::IsHardcoreModeActive())
+					goto error;
+				// Uses the generic debugger categories, so new registers show up by themselves.
+				const std::optional<std::vector<u8>> regs = RunOnCPUThreadAndWait<std::vector<u8>>([]() {
+					std::vector<u8> data;
+					if (VMManager::GetState() != VMState::Paused)
+						return data;
+					AppendResult<u32>(data, r5900Debug.getPC());
+					const int categories = r5900Debug.getRegisterCategoryCount();
+					AppendResult<u8>(data, static_cast<u8>(categories));
+					for (int cat = 0; cat < categories; cat++)
+					{
+						const int count = r5900Debug.getRegisterCount(cat);
+						AppendResult<u8>(data, static_cast<u8>(cat));
+						AppendResultString(data, r5900Debug.getRegisterCategoryName(cat));
+						AppendResult<u16>(data, static_cast<u16>(count));
+						AppendResult<u8>(data, static_cast<u8>(r5900Debug.getRegisterSize(cat) / 8));
+						for (int num = 0; num < count; num++)
+						{
+							AppendResultString(data, r5900Debug.getRegisterName(cat, num));
+							AppendResult<u128>(data, r5900Debug.getRegister(cat, num));
+						}
+					}
+					return data;
+				});
+				if (!regs.has_value() || regs->empty() || !CopyResult(ret_buffer, regs.value(), ret_cnt))
+					goto error;
+				break;
+			}
+			case MsgAddExecBreakpoint:
+			{
+				if (!SafetyChecks(buf_cnt, 4, ret_cnt, 0, buf_size)) [[unlikely]]
+					goto error;
+				const u32 addr = FromSpan<u32>(buf, buf_cnt);
+				buf_cnt += 4;
+				std::string condition, description;
+				if (!ReadRequestString(buf, buf_size, buf_cnt, &condition) ||
+					!ReadRequestString(buf, buf_size, buf_cnt, &description))
+				{
+					goto error;
+				}
+				if (!VMManager::HasValidVM() || Achievements::IsHardcoreModeActive())
+					goto error;
+				// Mirrors BreakpointModel: parse the condition, then add on the CPU thread.
+				// Requires paused, so CBreakPoints::Update() doesn't pause and resume the VM itself.
+				const std::optional<bool> added = RunOnCPUThreadAndWait<bool>([addr, condition, description]() {
+					if (VMManager::GetState() != VMState::Paused)
+						return false;
+					BreakPointCond cond;
+					if (!condition.empty())
+					{
+						std::string expr_error;
+						if (!r5900Debug.initExpression(condition.c_str(), cond.expression, expr_error))
+						{
+							Console.Error(fmt::format("PINE: Invalid breakpoint condition '{}': {}", condition, expr_error));
+							return false;
+						}
+						cond.debug = &r5900Debug;
+						cond.expressionString = condition;
+					}
+					if (CBreakPoints::IsAddressBreakPoint(BREAKPOINT_EE, addr))
+						CBreakPoints::RemoveBreakPoint(BREAKPOINT_EE, addr);
+					CBreakPoints::AddBreakPoint(BREAKPOINT_EE, addr);
+					CBreakPoints::ChangeBreakPointDescription(BREAKPOINT_EE, addr, description);
+					if (!condition.empty())
+						CBreakPoints::ChangeBreakPointAddCond(BREAKPOINT_EE, addr, cond);
+					return true;
+				});
+				if (!added.value_or(false))
+					goto error;
+				break;
+			}
+			case MsgRemoveBreakpoint:
+			{
+				if (!SafetyChecks(buf_cnt, 4, ret_cnt, 0, buf_size)) [[unlikely]]
+					goto error;
+				const u32 addr = FromSpan<u32>(buf, buf_cnt);
+				buf_cnt += 4;
+				if (!VMManager::HasValidVM() || Achievements::IsHardcoreModeActive())
+					goto error;
+				const std::optional<bool> removed = RunOnCPUThreadAndWait<bool>([addr]() {
+					if (VMManager::GetState() != VMState::Paused || !CBreakPoints::IsAddressBreakPoint(BREAKPOINT_EE, addr))
+						return false;
+					CBreakPoints::RemoveBreakPoint(BREAKPOINT_EE, addr);
+					return true;
+				});
+				if (!removed.value_or(false))
+					goto error;
+				break;
+			}
+			case MsgListBreakpoints:
+			{
+				if (Achievements::IsHardcoreModeActive())
+					goto error;
+				const std::optional<std::vector<u8>> list = RunOnCPUThreadAndWait<std::vector<u8>>([]() {
+					const std::vector<BreakPoint> breakpoints = CBreakPoints::GetBreakpoints(BREAKPOINT_EE, false);
+					std::vector<u8> data;
+					AppendResult<u32>(data, static_cast<u32>(breakpoints.size()));
+					for (const BreakPoint& bp : breakpoints)
+					{
+						AppendResult<u32>(data, bp.addr);
+						AppendResult<u8>(data, bp.enabled);
+						AppendResultString(data, bp.hasCond ? std::string_view(bp.cond.expressionString) : std::string_view());
+						AppendResultString(data, bp.description);
+					}
+					return data;
+				});
+				if (!list.has_value() || !CopyResult(ret_buffer, list.value(), ret_cnt))
+					goto error;
+				break;
+			}
+			case MsgGSDump:
+			{
+				std::string path;
+				if (!ReadRequestString(buf, buf_size, buf_cnt, &path))
+					goto error;
+				if (!SafetyChecks(buf_cnt, 4, ret_cnt, 0, buf_size)) [[unlikely]]
+					goto error;
+				const u32 frames = FromSpan<u32>(buf, buf_cnt);
+				buf_cnt += 4;
+				// The renderer only takes a full path ending in .png, otherwise it silently
+				// picks its own name. Empty means its own name in the snapshots folder.
+				if (!path.empty() && !StringUtil::EndsWithNoCase(path, ".png"))
+					goto error;
+				if (!VMManager::HasValidVM() || Achievements::IsHardcoreModeActive())
+					goto error;
+				// Same as Tools > Save Single Frame GS Dump; written at the next presented frame.
+				const std::optional<bool> queued = RunOnCPUThreadAndWait<bool>([path, frames]() {
+					MTGS::RunOnGSThread([path, frames]() { GSQueueSnapshot(path, frames); });
+					return true;
+				});
+				if (!queued.has_value())
 					goto error;
 				break;
 			}
